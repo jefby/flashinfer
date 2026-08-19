@@ -1,6 +1,6 @@
 # FlashInfer 代码架构与流程分析
 
-> 分析时间：基于当前仓库 HEAD（`d57bfb19`，约 2025-08 状态）
+> 分析时间：基于当前仓库 HEAD（`84dd1e60`，2026-08-19 状态，自 `d57bfb19` 后新增 76 个提交）
 > 代码规模：`include/` + `flashinfer/` + `csrc/` 合计约 **18 万行**（C++/CUDA + Python）
 
 ---
@@ -12,7 +12,8 @@
 - **JIT（Just-In-Time）编译为默认路径**：内核代码随参数（dtype、head_dim 等）动态特化编译，改 `.cuh` 源码无需重装包即可生效，天然适合开发迭代。
 - **框架无关的内核层**：`include/` 下的 CUDA 内核只接受裸指针（raw pointer），不依赖 PyTorch；框架绑定由 `csrc/` 通过 **TVM-FFI** 统一 ABI 完成，理论上可对接 Python/C++/Rust 等多种语言。
 - **面向现代 GPU 架构**：支持 SM75/80/86/89/90/100/103/107/110/120/121，每个架构有专属的 kernel 变体与编译 flag（如 sm90a、sm100a、sm120f）。
-- **覆盖完整推理原语**：Prefill/Decode 注意力（含 MLA、POD、KDA、NVFP4 等变体）、GEMM（FP4/FP8/BF16/MXFP4）、MoE（CUTLASS / TRT-LLM / CuTe-DSL 多后端）、采样/TopK、量化、Norm、RoPE、通信（AllReduce/AllToAll）等。
+- **覆盖完整推理原语**：Prefill/Decode 注意力（含 MLA、POD、KDA、NVFP4、Block-Sparse 等变体）、GEMM（FP4/FP8/BF16/MXFP4）、MoE（CUTLASS / TRT-LLM / CuTe-DSL 多后端，含 Distribution-Aware 变体）、采样/TopK、量化、Norm、RoPE、通信（AllReduce/AllToAll）等。
+- **执行范式多元化**：除经典的「Jinja 特化 + nvcc JIT」外，还并存 CuTe-DSL（Python DSL 生成）与 **PrimTS（Python 编排的 task-scheduled primitives）** 两条新内核产出路径。
 
 ---
 
@@ -43,6 +44,11 @@ flashinfer/
 │   │   ├── cute_dsl_core.py  #      CuTe-DSL 内核的 JIT 子类（JitSpecCuteDsl）
 │   │   └── cubin_loader.py   #      预编译 cubin 下载/校验
 │   ├── attention/ gemm/ fused_moe/ mla/ ...  # 各领域的高层 Python API
+│   ├── attention/prims_ts/   #  PrimTS 执行范式（Python 编排的 task-scheduled 内核）
+│   │   └── _block_sparse/    #     block-sparse 注意力（compiler/plan/prepared/runtime）
+│   ├── cute_dsl/sparse/      #  CuTe-DSL block-sparse 注意力内核（sm100/sm120）
+│   ├── kda_kernels/          #  Packed KDA decode（Cake 内核封装）
+│   ├── fused_moe/da_*.py     #  Distribution-Aware MoE（路由分布感知的 plan/CUDA Graph）
 │   ├── decode.py prefill.py  #    核心 Wrapper（plan/run 模式，工作量缓存）
 │   ├── aot.py                #    AOT 预编译入口（生成 flashinfer-jit-cache 包）
 │   ├── api_logging.py        #    @flashinfer_api 装饰器（日志/诊断/数据 dump）
@@ -294,6 +300,31 @@ DISPATCH_DTYPE(input_dtype, DTypeIn, {
 - 计时器自动选择：普通环境用 `cudaEvent`，机密计算（Confidential Computing）下 `cudaEventElapsedTime` 不可靠，改用 GPU `%globaltimer` 寄存器（`FLASHINFER_AUTOTUNE_TIMER` 可强制）
 - 结果可序列化落盘（`FLASHINFER_AUTOTUNER_LOAD_FROM_FILE=1` 复用），`FLASHINFER_TACTICS_BLOCKLIST` 支持跳过已知会导致 hang/crash 的 tactics
 
+### 6.7 PrimTS 执行范式（`attention/prims_ts/`）
+
+PrimTS（Primitives + Task Scheduler）是与「Jinja 特化 + nvcc JIT」并列的**新执行范式**：内核的调度策略、资源分配（SMEM/TMEM、TMA）与 launch 编排全部在 **Python 侧**完成，而非 C++ 启动器：
+
+```
+Python 用户 API（Wrapper / one-shot）
+      │  @flashinfer_api（部分 API 不注册 trace，见 context.py 说明）
+      ▼
+prims_ts/<domain>.py（context / decode / block_sparse）
+      │  - 语义层 API，隐藏调度器选择
+      │  - plan/compiler 把请求编译为可执行计划（含资源预算）
+      ▼
+prims_ts/kernels/<family>/（fmha_context / fmha_decode ...）
+      │  - kernel module：fmha_decode_kernel.py + resources/
+      │    （smem_*/tmem_* 资源模块、softmax/输出/索引 helpers）
+      │  - 支持 tcgen05（TMEM）路径（kernels/tcgen05_compat.py）
+      ▼
+CuTe-DSL 或 CUDA 内核 launch（任务调度：CLC / static persistent / live-ragged）
+```
+
+关键点：
+- **Block-Sparse 子模块**（`prims_ts/_block_sparse/`）：compiler（适配器编译与缓存）/ config / plan / prepared / runtime 分层，物理执行 tile（Q64×KV256）与语义 BSR block size、物理 page size 解耦；支持 contiguous 与 paged K/V、MHA/GQA/MQA、per-request K/V 长度与逻辑 token mask。
+- **调度策略多样**：contiguous K/V 用 persistent CLC；paged 计划按 CTA 网格规模在 static-persistent raster（重 tile 优先）与单 CTA-per-tile 间切换；causal 窗口右下对齐。
+- 公共 API：`BlockSparseTSWrapper` / `BlockSparsePagedTSWrapper` / `block_sparse_attention[_with_paged_kv_cache]`。
+
 ---
 
 ## 7. 功能模块地图
@@ -305,9 +336,13 @@ DISPATCH_DTYPE(input_dtype, DTypeIn, {
 | MLA | `mla/`、`decode.py` | `jit/mla.py` | `attention/mla*.cuh`、`csrc/batch_mla*`、`sparse_mla_sm120*` |
 | POD（Point of Decode） | `pod.py` | `jit/attention/modules.py` | `attention/batch_pod.cuh`、`csrc/batch_pod*.cu` |
 | Cascade（共享前缀） | `cascade.py` | `jit/cascade.py` | `attention/cascade.cuh` |
-| KDA（Delta rule） | `kda*.py`、`gdn_*.py` | `jit/flash_kda*.py` | `attention/blackwell/`、`csrc/kda/`、`csrc/gdn*` |
+| KDA（Delta rule） | `kda*.py`、`gdn_*.py` | `jit/flash_kda*.py`、`jit/cake_kda_packed_t1.py`、`jit/cake_flash_kda_packed_t1.py` | `attention/blackwell/`、`csrc/kda/`（含 `cake_*_packed_*` 系列）、`csrc/gdn*` |
+| Packed KDA Decode（Kimi K3） | `kda_kernels/cake_packed_kda_decode.py`、`kda_decode.py::packed_kda_decode` | `jit/cake_kda_packed_t1.py` | `csrc/kda/cake_kda_packed_t1_*.cu`、`cake_flashkda_bf16_*.cu`（SM100a/103a 特化，H12/T1） |
+| Block-Sparse 注意力 | `attention/prims_ts/block_sparse.py`（`BlockSparseTSWrapper`/`BlockSparsePagedTSWrapper`）、`sparse.py`（`bsa_attn_sm100_blk128_fwd` 等） | `jit/cute_dsl_core.py` | `cute_dsl/sparse/`（sm100_blk128/64、sm120_blk64）、`prims_ts/_block_sparse/`（PrimTS Q64×KV256 + paged GQA/MHA/MQA） |
 | GEMM | `gemm/`、`grouped_mm/` | `jit/gemm/`、`jit/tinygemm2.py` 等 | `gemm/*.cuh`、`csrc/*_gemm*.cu`（FP4/FP8/MXFP4/BF16，CUTLASS/CuTe-DSL/cuBLASLt/TRT-LLM） |
 | MoE | `fused_moe/` | `jit/fused_moe.py`、`jit/bgmv_moe.py` 等 | `fused_moe/*.cuh`、`csrc/fused_moe/`（CUTLASS/TRT-LLM/CuTe-DSL 后端） |
+| Distribution-Aware MoE | `fused_moe/da_config.py`、`da_moe.py`、`da_runtime.py`、`da_tuner.py` | 运行时编译（`DAPlanCompiler`） | TRT-LLM DA 路由内核 + CUDA Graph 多 lane 回放 |
+| MXFP8+MXFP4 MoE | `fused_moe/cute_dsl/fused_moe_mxfp8_mxfp4.py` | `fused_moe/cute_dsl/mixed_tuner.py` | CuTe-DSL SM12x 混合精度 MoE 内核 |
 | 量化 | `quantization/`、`fp4/fp8_quantization.py` | `jit/fp4/fp8_quantization.py` 等 | `quantization.cuh`、`csrc/quantization.cu` |
 | 采样/TopK | `sampling.py`、`topk*.py` | `jit/sampling.py`、`jit/topk.py` | `sampling.cuh`、`topk.cuh`、`csrc/topk.cu` |
 | Norm | `norm/` | `jit/norm.py`、`jit/rmsnorm_silu.py` | `norm/*.cuh`、`csrc/norm.cu`、`rmsnorm_silu.cu` |
@@ -351,18 +386,20 @@ DISPATCH_DTYPE(input_dtype, DTypeIn, {
 | 测试 | `pytest tests/` | 按模块分目录（attention/gemm/moe/comm/jit/trace/autotuner...）；`conftest.py` 自动跳过 OOM 测试；GPU 架构守卫 `is_sm90a_supported()` 等 |
 | 基准 | `benchmarks/flashinfer_benchmark.py` | 统一框架，多后端对比（fa2/fa3/cudnn/cutlass/trtllm/cublas），CUPTI 计时（无则回落 CUDA Event），CSV 输出 |
 | 代码检查 | `pre-commit run -a` | ruff/clang-format 等钩子 |
-| CI | `Jenkinsfile`、`.github/workflows/`、`ci/`、`scripts/task_run_unit_tests.sh` | 多架构矩阵、sharding 支持 |
+| CI | `Jenkinsfile`、`.github/workflows/`、`ci/`、`scripts/task_run_unit_tests.sh` | 多架构矩阵、sharding 支持；新增 PR API 文档检查/PR 测试清理工作流（`pr-api-doc-checks.yml` 等）；pytest node ID 稳定化便于外部工具引用 |
 | 文档同步 | `docs/`、`.claude/skills/` | 架构说明与技能教程随代码同步更新 |
 
 ---
 
 ## 10. 架构演进要点（近期提交反映的趋势）
 
-1. **内核层大幅向 CuTe-DSL / CUTLASS 迁移**：新内核（MoE B12x、FP4 GEMM、MLA sm120、NVFP4）越来越多走 Python DSL 或 CUTLASS 生成，而非手写 CUDA（`cute_dsl/`、`jit/cute_dsl_core.py`）。
-2. **架构专门化加剧**：SM100/SM120/SM12x 专属内核与 `-gencode` 特化越来越多，`CompilationContext` 的 supported_major_versions 机制保证老架构不受影响。
-3. **观测性成为一等公民**：`@flashinfer_api` 日志/数据 dump、`fi_trace`/`trace_apply`、API 日志统计模块（`jit/api_log_stats.py`）持续增强。
-4. **向后兼容与 AOT 并存**：JIT 是开发默认，AOT/cubin 是部署优化，二者由 `JitSpec.build_and_load` 统一调度，保证同一套代码路径。
-5. **与 vLLM/TRT-LLM 生态深度耦合**：大量 `trtllm_*` 内核、routing replay、低延迟 GEMM 表明其作为推理框架底层内核库的定位。
+1. **PrimTS 成为新的内核产出范式**：Block-Sparse / paged context / decode 注意力开始走「Python 编排 + task-scheduled primitives」（`attention/prims_ts/`），调度与资源管理上移到 Python，与 CuTe-DSL、手写 CUDA 三轨并存。
+2. **内核层大幅向 CuTe-DSL / CUTLASS 迁移**：新内核（MoE B12x、MXFP8+MXFP4 混合 MoE、FP4 GEMM、BSA sm120、MLA sm120、NVFP4）越来越多走 Python DSL 或 CUTLASS 生成（`cute_dsl/`、`jit/cute_dsl_core.py`）。
+3. **架构专门化加剧**：SM100/SM120/SM12x 专属内核与 `-gencode` 特化越来越多（如 Cake packed-KDA 仅针对 SM100a/103a、XQA head_dim 512 仅 SM12x），`CompilationContext` 的 supported_major_versions 机制保证老架构不受影响。
+4. **运行时自适应成为标配**：MoE 出现 Distribution-Aware（DA）变体——按路由分布编译 plan、用 CUDA Graph 多 lane 回放降低 host 开销（`fused_moe/da_*.py` + `FLASHINFER_DIST_AWARE_AUTOTUNE`）；MoE 配置持续拆分（`MoEFinalizeConfig` 独立、zero-copy workspace 输出视图）。
+5. **推理服务语义前移**：新增 Kimi K3 风格 packed KDA decode（`packed_kda_decode`，融合 Q/K 提取、L2 归一、gate 变换与状态更新的单内核）、TopKSigmoid 路由、Gemma-style GQA head_dim 512，持续贴服 vLLM/TRT-LLM 生产负载。
+6. **观测性成为一等公民**：`@flashinfer_api` 日志/数据 dump、`fi_trace`/`trace_apply`、API 日志统计模块（`jit/api_log_stats.py`）持续增强。
+7. **向后兼容与 AOT 并存**：JIT 是开发默认，AOT/cubin 是部署优化，二者由 `JitSpec.build_and_load` 统一调度；API 更名时提供向后兼容别名（如 `bsa_attn_fwd` → `bsa_attn_sm100_blk128_fwd`）。
 
 ---
 
